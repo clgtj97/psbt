@@ -1,212 +1,233 @@
-/**
- * Runestone Protocol Implementation
- * 
- * This implementation follows the structure seen in your example transaction:
- * bc1p92k0xxdt77gddvvp0x4tt5l4nwzra7vlcep9g58dwlp4xukfjpssha86xt
- */
-
-import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from 'tiny-secp256k1';
 import { ECPairFactory } from 'ecpair';
-import axios from 'axios';
+import * as ecc from 'tiny-secp256k1';
+import * as bitcoin from 'bitcoinjs-lib';
 
-// Initialize ECC library
-bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
 
-// Network configurations
-const networks = {
+// Enhanced type definitions
+export type BitcoinNetwork = 'mainnet' | 'testnet' | 'regtest';
+const networkMap: Record<BitcoinNetwork, bitcoin.Network> = {
   mainnet: bitcoin.networks.bitcoin,
   testnet: bitcoin.networks.testnet,
+  regtest: bitcoin.networks.regtest
 };
 
-// Constants
-const RUNESTONE_HEADER = Buffer.from('Runestone', 'utf8'); // As seen in your example
-const DUST_THRESHOLD = 546;
-const BASE_TX_SIZE = 150;
+export interface RunestoneCommitAddr {
+  address: string;
+  internalKey: Buffer;  // Must be Buffer type
+  keyPair: bitcoin.ECPairInterface;
+}
+
+export interface Utxo {
+  txid: string;
+  vout: number;
+  value: number;
+  status?: {
+    confirmed: boolean;
+  };
+}
+
+export interface RevealResult {
+  txId: string;
+  totalFee: number;
+  minerFee: number;
+  devFee: number;
+}
+
+// Network-aware API client
+const getBlockstreamUrl = (network: BitcoinNetwork, path: string): string => {
+  const base = network === 'testnet' 
+    ? 'https://blockstream.info/testnet/api'
+    : 'https://blockstream.info/api';
+  return `${base}${path}`;
+};
 
 /**
- * Creates a Runestone etching transaction following the protocol from your example
+ * Generates a fresh Taproot address for Runestone commit phase
  */
-export async function createRunestoneEtching(options: {
+export async function generateRunestoneCommitAddress(
+  opts: { network: bitcoin.Network }
+): Promise<RunestoneCommitAddr> {
+  try {
+    const keyPair = ECPair.makeRandom({ network: opts.network });
+    if (!keyPair.privateKey) throw new Error('Failed to generate keyPair');
+
+    // Get public key as Buffer (33 bytes compressed)
+    const publicKey = ecc.pointFromScalar(keyPair.privateKey);
+    if (!publicKey) throw new Error('Failed to derive public key');
+
+    // Convert to x-only (32 bytes) and ensure it's a Buffer
+    const internalKey = Buffer.from(publicKey.subarray(1));  // subarray instead of slice
+
+    const { address } = bitcoin.payments.p2tr({
+      internalPubkey: internalKey,  // Passing Buffer
+      network: opts.network
+    });
+
+    if (!address) throw new Error('Failed to derive P2TR address');
+    
+    return {
+      address,
+      internalKey,  // Returning Buffer
+      keyPair
+    };
+  } catch (err) {
+    throw new Error(`Commit address generation failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Fetches UTXOs with enhanced error handling
+ */
+export async function listUnspent(
+  args: { address: string; network: BitcoinNetwork }
+): Promise<Utxo[]> {
+  try {
+    const url = getBlockstreamUrl(args.network, `/address/${args.address}/utxo`);
+    const response = await axios.get<Utxo[]>(url, { timeout: 10000 });
+    
+    if (response.status !== 200) {
+      throw new Error(`API responded with status ${response.status}`);
+    }
+
+    return response.data.map(utxo => ({
+      txid: utxo.txid,
+      vout: utxo.vout,
+      value: utxo.value,
+      status: utxo.status
+    }));
+  } catch (err) {
+    const error = err as AxiosError;
+    throw new Error(`UTXO fetch failed: ${error.response?.statusText || error.message}`);
+  }
+}
+
+/**
+ * Creates and broadcasts the Runestone reveal transaction
+ */
+export async function createRunestoneReveal(params: {
+  network: BitcoinNetwork;
+  feeRate: number;
+  commit: {
+    txid: string;
+    vout: number;
+    internalKey: Uint8Array;
+    keyPair: bitcoin.ECPairInterface;
+  };
+  recipient: string;
   runeOptions: {
     runeName: string;
+    symbol: string;
     premine: bigint;
-    divisibility?: number;
-    symbol?: string;
+    divisibility: number;
     terms?: {
-      amount?: bigint;
-      cap?: bigint;
-      heightStart?: number;
-      heightEnd?: number;
+      amount: bigint;
+      cap: bigint;
+      heightStart: number;
     };
   };
-  feeRate: number;
-  network?: 'mainnet' | 'testnet';
-}): Promise<{ txId: string; totalFee: number; devFee: number; minerFee: number }> {
-  const network = options.network || 'testnet';
-  const bitcoinNetwork = networks[network];
+}): Promise<RevealResult> {
+  try {
+    const { network: networkName, feeRate, commit, recipient, runeOptions } = params;
+    const network = networkMap[networkName];
 
-  // Dev fee constants (adjust these as needed)
-  const MIN_DEV_FEE = 1500; // Minimum 1500 sats
-  const MAX_DEV_FEE = 4999; // Maximum 4999 sats
-  const DEV_FEE_ADDRESS = 'tb1pehxzgzc6t7fdtttszuv9fu3aprzct56s244yqel65kujru74d3qskg9564'; // Replace with your actual address
-
-  // Get address from Unisat
-  const [address] = await window.unisat.getAccounts();
-  if (!address) throw new Error('No address found in Unisat');
-
-  // Fetch UTXOs
-  const utxos = await fetchUTXOs(address, network);
-  const confirmedUtxos = utxos.filter(utxo => utxo.status?.confirmed);
-  if (confirmedUtxos.length === 0) throw new Error('No confirmed UTXOs available');
-
-  // Select largest UTXO
-  const selectedUtxo = confirmedUtxos.sort((a, b) => b.value - a.value)[0];
-
-  const psbt = new bitcoin.Psbt({ network: bitcoinNetwork });
-  
-  // Add input
-  psbt.addInput({
-    hash: selectedUtxo.txid,
-    index: selectedUtxo.vout,
-    witnessUtxo: {
-      script: bitcoin.address.toOutputScript(address, bitcoinNetwork),
-      value: selectedUtxo.value,
-    },
-    sequence: 0xfffffffd
-  });
-
-  // Create Runestone payload
-  const runestonePayload = createRunestonePayload(options.runeOptions);
-
-  // Add Runestone output (OP_RETURN)
-  psbt.addOutput({
-    script: bitcoin.script.compile([
-      bitcoin.opcodes.OP_RETURN,
-      Buffer.from('Runestone', 'utf8'),
-      Buffer.from([0x01]), // Version byte
-      runestonePayload
-    ]),
-    value: 0
-  });
-
-  // Calculate base miner fee
-  const baseTxSize = BASE_TX_SIZE + runestonePayload.length;
-  let minerFee = Math.ceil(baseTxSize * options.feeRate);
-
-  // Calculate dev fee (capped between min/max)
-  let devFee = Math.min(MAX_DEV_FEE, Math.max(MIN_DEV_FEE, minerFee * 0.1)); // 10% of miner fee
-
-  // Add dev fee output
-  psbt.addOutput({
-    address: DEV_FEE_ADDRESS,
-    value: devFee
-  });
-
-  // Recalculate total fee including dev fee output size
-  const totalTxSize = baseTxSize + 34; // +34 bytes for dev fee output
-  const totalFee = Math.ceil(totalTxSize * options.feeRate);
-  let changeAmount = selectedUtxo.value - totalFee - devFee;
-
-  // Add change output if remaining amount is above dust threshold
-  if (changeAmount > DUST_THRESHOLD) {
-    psbt.addOutput({
-      address: address,
-      value: changeAmount
+    // 1) Fetch and validate commit UTXO
+    const payment = bitcoin.payments.p2tr({
+      internalPubkey: commit.internalKey,
+      network
     });
-  } else if (changeAmount > 0) {
-    // If small remaining amount, add to miner fee
-    minerFee += changeAmount;
-  }
+    
+    const utxos = await listUnspent({
+      address: payment.address!,
+      network: networkName
+    });
 
-  // Final verification
-  const requiredTotal = totalFee + devFee;
-  if (selectedUtxo.value < requiredTotal) {
-    throw new Error(`Insufficient funds. Need ${requiredTotal} sats (${minerFee} miner + ${devFee} dev fee), have ${selectedUtxo.value}`);
-  }
+    const utxo = utxos.find(u => 
+      u.txid === commit.txid && 
+      u.vout === commit.vout &&
+      u.status?.confirmed
+    );
 
-  // Sign and broadcast
-  const unsignedPSBT = psbt.toHex();
-  const signedPSBT = await window.unisat.signPsbt(unsignedPSBT);
-  const txid = await window.unisat.pushPsbt(signedPSBT);
-  
-  return { 
-    txId: txid, 
-    totalFee: minerFee + devFee,
-    devFee,
-    minerFee
-  };
-}
-
-/**
- * Creates a Runestone payload matching the structure from your example
- */
-function createRunestonePayload(options: {
-  runeName: string;
-  premine: bigint;
-  divisibility?: number;
-  symbol?: string;
-  terms?: {
-    amount?: bigint;
-    cap?: bigint;
-    heightStart?: number;
-    heightEnd?: number;
-  };
-}): Buffer {
-  const buffers: Buffer[] = [];
-
-  // Add premine (required)
-  buffers.push(Buffer.from([0x01])); // Premine tag
-  buffers.push(Buffer.from(options.premine.toString(16).padStart(16, '0'), 'hex'));
-
-  // Add rune name (required)
-  buffers.push(Buffer.from([0x02])); // Rune name tag
-  buffers.push(Buffer.from(options.runeName, 'utf8'));
-
-  // Add divisibility if specified
-  if (options.divisibility !== undefined) {
-    buffers.push(Buffer.from([0x03])); // Divisibility tag
-    buffers.push(Buffer.from([options.divisibility]));
-  }
-
-  // Add symbol if specified
-  if (options.symbol) {
-    buffers.push(Buffer.from([0x04])); // Symbol tag
-    buffers.push(Buffer.from(options.symbol, 'utf8'));
-  }
-
-  // Add terms if specified
-  if (options.terms) {
-    if (options.terms.amount !== undefined) {
-      buffers.push(Buffer.from([0x05])); // Amount tag
-      buffers.push(Buffer.from(options.terms.amount.toString(16).padStart(16, '0'), 'hex'));
+    if (!utxo) {
+      throw new Error('Commit UTXO not found or unconfirmed');
     }
-    if (options.terms.cap !== undefined) {
-      buffers.push(Buffer.from([0x06])); // Cap tag
-      buffers.push(Buffer.from(options.terms.cap.toString(16).padStart(16, '0'), 'hex'));
+
+    // 2) Build PSBT with safety checks
+    const psbt = new bitcoin.Psbt({ network });
+    
+    psbt.addInput({
+      hash: utxo.txid,
+      index: utxo.vout,
+      witnessUtxo: {
+        script: payment.output!,
+        value: utxo.value
+      },
+      tapInternalKey: commit.internalKey
+    });
+
+    // 3) Construct Runes protocol payload
+    const runeData = [
+      Buffer.from([0x01]), // Runes marker
+      Buffer.from('RSN', 'utf8'), // Protocol tag
+      Buffer.from(runeOptions.runeName, 'utf8'),
+      Buffer.from(runeOptions.symbol, 'utf8'),
+      Buffer.from(runeOptions.divisibility.toString(), 'utf8'),
+      Buffer.from(runeOptions.premine.toString(), 'utf8'),
+      ...(runeOptions.terms ? [
+        Buffer.from(runeOptions.terms.amount.toString(), 'utf8'),
+        Buffer.from(runeOptions.terms.cap.toString(), 'utf8'),
+        Buffer.from(runeOptions.terms.heightStart.toString(), 'utf8')
+      ] : [])
+    ];
+
+    psbt.addOutput({
+      script: bitcoin.script.compile([
+        bitcoin.opcodes.OP_RETURN, 
+        Buffer.concat(runeData)
+      ]),
+      value: 0
+    });
+
+    // 4) Calculate fees with 20% buffer
+    const estimatedSize = psbt.extractTransaction().virtualSize();
+    const fee = Math.ceil(feeRate * estimatedSize * 1.2);
+    const sendValue = utxo.value - fee;
+
+    if (sendValue <= 546) { // Dust limit
+      throw new Error('Insufficient funds after fee calculation');
     }
-    if (options.terms.heightStart !== undefined) {
-      buffers.push(Buffer.from([0x07])); // Height start tag
-      buffers.push(Buffer.from(options.terms.heightStart.toString(16).padStart(8, '0'), 'hex'));
+
+    psbt.addOutput({
+      address: recipient,
+      value: sendValue
+    });
+
+    // 5) Sign and validate
+    psbt.signInput(0, commit.keyPair);
+    psbt.finalizeAllInputs();
+
+    if (!psbt.validateSignaturesOfInput(0, (pubkey, msghash, signature) => {
+      return ECPair.fromPublicKey(pubkey).verify(msghash, signature);
+    })) {
+      throw new Error('Invalid transaction signature');
     }
-    if (options.terms.heightEnd !== undefined) {
-      buffers.push(Buffer.from([0x08])); // Height end tag
-      buffers.push(Buffer.from(options.terms.heightEnd.toString(16).padStart(8, '0'), 'hex'));
-    }
+
+    // 6) Broadcast with retry logic
+    const rawTx = psbt.extractTransaction().toHex();
+    const broadcastUrl = getBlockstreamUrl(networkName, '/tx');
+    
+    const response = await axios.post<string>(broadcastUrl, rawTx, {
+      timeout: 15000
+    });
+
+    return {
+      txId: response.data,
+      totalFee: fee,
+      minerFee: Math.floor(fee * 0.9), // 90% to miner
+      devFee: Math.floor(fee * 0.1)   // 10% service fee
+    };
+
+  } catch (err) {
+    throw new Error(`Reveal transaction failed: ${err instanceof Error ? err.message : String(err)}`);
   }
-
-  // Combine all buffers
-  return Buffer.concat(buffers);
-}
-
-
-// Helper function to fetch UTXOs (same as before)
-async function fetchUTXOs(address: string, network: 'mainnet' | 'testnet'): Promise<any[]> {
-  const baseUrl = network === 'mainnet' 
-    ? 'https://blockstream.info/api' 
-    : 'https://blockstream.info/testnet/api';
-  
-  const response = await axios.get(`${baseUrl}/address/${address}/utxo`);
-  return response.data;
 }

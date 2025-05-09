@@ -8,10 +8,10 @@ export default defineConfig({
   plugins: [
     react(),
     nodePolyfills({
-      include: ['buffer', 'crypto', 'stream'],
+      include: ['buffer', 'crypto'],
       globals: {
         Buffer: true,
-        process: true
+        process: true,
       }
     }),
     wasm(),
@@ -24,14 +24,17 @@ export default defineConfig({
   resolve: {
     alias: {
       crypto: 'crypto-browserify',
-      stream: 'stream-browserify'
+      stream: 'stream-browserify',
+      buffer: 'buffer/'
     }
   },
   optimizeDeps: {
     include: [
       'buffer',
       'crypto-browserify',
-      'stream-browserify'
+      'bitcoinjs-lib',
+      'ecpair',
+      'tiny-secp256k1'
     ],
     esbuildOptions: {
       target: 'es2020',
